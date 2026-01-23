@@ -1,4 +1,3 @@
 repository "HoloLensObjectReplacement/HoloLensObjectReplacement@18968354369565@cloud"
   path "/"
-    br "/main"
-    co "/main"
+    smartbranch "/main"
