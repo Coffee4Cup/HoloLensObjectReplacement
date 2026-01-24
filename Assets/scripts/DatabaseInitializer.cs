@@ -1,4 +1,3 @@
-using Unity.VisualScripting.Antlr3.Runtime.Tree;
 using UnityEngine;
 
 public class DatabaseInitializer : MonoBehaviour
@@ -7,17 +6,26 @@ public class DatabaseInitializer : MonoBehaviour
     {
         ModelDatabase db = GetComponent<ModelDatabase>();
 
-        // Load test model from Resources
-        GameObject testModel = Resources.Load<GameObject>("Models/TestModel");
+        // Method 1: If prefabs are directly in Models/
+        AddModelIfExists(db, "Models/WashingMachine1", "Samsung Front Load");
+        AddModelIfExists(db, "Models/WashingMachine2", "LG Top Load");
 
-        if (testModel != null)
+        // Method 2: If prefabs are in subfolders like Models/WM1/WM1.prefab
+        // AddModelIfExists(db, "Models/WashingMachine1/WashingMachine1", "Samsung Front Load");
+        // AddModelIfExists(db, "Models/WashingMachine2/WashingMachine2", "LG Top Load");
+    }
+
+    void AddModelIfExists(ModelDatabase db, string path, string displayName)
+    {
+        GameObject model = Resources.Load<GameObject>(path);
+        if (model != null)
         {
-            db.AddModel(testModel, "Test Washing Machine", "appliance_large");
-            Debug.Log("Added test model to database!");
+            db.AddModel(model, displayName, "appliance_large");
+            Debug.Log($"Added {displayName} from path: {path}");
         }
         else
         {
-            Debug.LogError("Could not find TestModel in Resources/Models/");
+            Debug.LogError($"Could not find model at path: {path}");
         }
     }
 }
