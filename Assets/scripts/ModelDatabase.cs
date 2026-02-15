@@ -5,6 +5,24 @@ using System.IO;
 using System;
 
 /// <summary>
+/// Serializable key-value pair to replace Dictionary (JsonUtility can't serialize Dictionary)
+/// </summary>
+[System.Serializable]
+public class SerializableKeyValue
+{
+    public string key;
+    public string value;
+
+    public SerializableKeyValue() { }
+
+    public SerializableKeyValue(string key, string value)
+    {
+        this.key = key;
+        this.value = value;
+    }
+}
+
+/// <summary>
 /// Database entry for a 3D model
 /// MRTK3 Compatible
 /// </summary>
@@ -17,16 +35,41 @@ public class ModelEntry
     public string modelPath; // Path to the 3D model file
     public string thumbnailPath;
     public MeshFeatures features;
-    public DateTime dateAdded;
+    public string dateAdded; // Changed from DateTime (not serializable by JsonUtility)
 
-    // Metadata
-    public Dictionary<string, string> metadata;
+    // Metadata - using serializable list instead of Dictionary
+    public List<SerializableKeyValue> metadata;
 
     public ModelEntry()
     {
         id = Guid.NewGuid().ToString();
-        dateAdded = DateTime.Now;
-        metadata = new Dictionary<string, string>();
+        dateAdded = DateTime.Now.ToString("o"); // ISO 8601 format
+        metadata = new List<SerializableKeyValue>();
+    }
+
+    /// <summary>
+    /// Helper: Get metadata value by key
+    /// </summary>
+    public string GetMetadata(string key)
+    {
+        var entry = metadata.Find(m => m.key == key);
+        return entry != null ? entry.value : null;
+    }
+
+    /// <summary>
+    /// Helper: Set metadata value by key
+    /// </summary>
+    public void SetMetadata(string key, string value)
+    {
+        var entry = metadata.Find(m => m.key == key);
+        if (entry != null)
+        {
+            entry.value = value;
+        }
+        else
+        {
+            metadata.Add(new SerializableKeyValue(key, value));
+        }
     }
 }
 
@@ -96,7 +139,7 @@ public class ModelDatabase : MonoBehaviour
     /// <summary>
     /// Add a new model to the database
     /// </summary>
-    public void AddModel(GameObject modelObject, string name, string category, Dictionary<string, string> metadata = null)
+    public void AddModel(GameObject modelObject, string name, string category, Dictionary<string, string> metadataDict = null)
     {
         if (!isInitialized)
         {
@@ -119,9 +162,13 @@ public class ModelDatabase : MonoBehaviour
             modelPath = "Models/" + modelObject.name
         };
 
-        if (metadata != null)
+        // Convert dictionary to serializable list
+        if (metadataDict != null)
         {
-            entry.metadata = metadata;
+            foreach (var kvp in metadataDict)
+            {
+                entry.metadata.Add(new SerializableKeyValue(kvp.Key, kvp.Value));
+            }
         }
 
         database.Add(entry);
@@ -161,6 +208,12 @@ public class ModelDatabase : MonoBehaviour
         // Calculate similarity scores
         foreach (ModelEntry entry in candidates)
         {
+            if (entry.features == null)
+            {
+                Debug.LogWarning($"Skipping model '{entry.name}' - no features extracted");
+                continue;
+            }
+
             float score = featureExtractor.CompareFeaturesSimple(queryFeatures, entry.features);
             string reason = BuildMatchReason(queryFeatures, entry.features, score);
             results.Add(new SearchResult(entry, score, reason));
@@ -183,6 +236,8 @@ public class ModelDatabase : MonoBehaviour
 
         foreach (ModelEntry entry in database)
         {
+            if (entry.features == null) continue;
+
             Vector3 entrySize = entry.features.boundingBoxSize;
 
             // Check if dimensions are within tolerance
@@ -295,8 +350,16 @@ public class ModelDatabase : MonoBehaviour
         {
             string json = File.ReadAllText(filePath);
             DatabaseWrapper wrapper = JsonUtility.FromJson<DatabaseWrapper>(json);
-            database = wrapper.entries;
-            Debug.Log($"Database loaded from {filePath}");
+            if (wrapper != null && wrapper.entries != null)
+            {
+                database = wrapper.entries;
+                Debug.Log($"Database loaded from {filePath} with {database.Count} entries");
+            }
+            else
+            {
+                Debug.LogWarning("Database file was empty or malformed, starting fresh");
+                database = new List<ModelEntry>();
+            }
         }
         catch (Exception e)
         {
@@ -311,6 +374,31 @@ public class ModelDatabase : MonoBehaviour
     public List<ModelEntry> GetByCategory(string category)
     {
         return database.Where(e => e.category == category).ToList();
+    }
+
+    /// <summary>
+    /// Get total number of models in database
+    /// </summary>
+    public int GetModelCount()
+    {
+        return database.Count;
+    }
+
+    /// <summary>
+    /// Clear all entries from the database and delete the saved file
+    /// </summary>
+    public void ClearDatabase()
+    {
+        database.Clear();
+
+        string dbFile = Path.Combine(Application.persistentDataPath, databasePath, "database.json");
+        if (File.Exists(dbFile))
+        {
+            File.Delete(dbFile);
+            Debug.Log("Database file deleted");
+        }
+
+        Debug.Log("Database cleared");
     }
 
     /// <summary>

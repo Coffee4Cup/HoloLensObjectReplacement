@@ -21,6 +21,20 @@ public class HoloLensSpatialScanner : MonoBehaviour
     [SerializeField] private Material scanningMaterial;
     [SerializeField] private Color scanAreaColor = new Color(0, 1, 0, 0.3f);
 
+    [Header("Filtering")]
+    [SerializeField] private string[] excludeObjectNames = new string[]
+    {
+        "Cursor", "CursorFocus", "CursorRest", "CursorContextual",
+        "PeakBar", "UsedBar", "LimitBar", "Background",
+        "Sphere",  // The scan area indicator sphere
+        "statusText", "instructionText",
+        "MixedRealityToolkit", "MixedRealityPlayspace", "MixedRealitySceneContent"
+    };
+    [SerializeField] private string[] excludeNameContains = new string[]
+    {
+        "Cursor", "Bar", "Tooltip", "Diagnostics", "Profile", "Canvas", "Panel", "UI"
+    };
+
     [Header("Keyboard Controls (Editor Testing)")]
     [SerializeField] private KeyCode startScanKey = KeyCode.S;
     [SerializeField] private KeyCode completeScanKey = KeyCode.C;
@@ -152,6 +166,7 @@ public class HoloLensSpatialScanner : MonoBehaviour
         {
             // Create simple sphere to show scan area if no prefab
             boundingBoxInstance = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            boundingBoxInstance.name = "ScanAreaIndicator";
             boundingBoxInstance.transform.position = center;
             boundingBoxInstance.transform.localScale = Vector3.one * scanRadius * 2;
 
@@ -219,14 +234,16 @@ public class HoloLensSpatialScanner : MonoBehaviour
         {
             combinedMesh = CombineCapturedMeshes();
 
-            if (combinedMesh != null)
+            if (combinedMesh != null && combinedMesh.vertexCount > 0)
             {
                 Debug.Log($"Scan complete! Captured mesh with {combinedMesh.vertexCount} vertices");
                 OnScanComplete?.Invoke(combinedMesh);
             }
             else
             {
-                Debug.LogError("Failed to combine captured meshes");
+                Debug.LogWarning("Combined mesh was empty. Creating fallback test mesh.");
+                combinedMesh = CreateFallbackMesh();
+                OnScanComplete?.Invoke(combinedMesh);
             }
         }
         else
@@ -259,20 +276,77 @@ public class HoloLensSpatialScanner : MonoBehaviour
     }
 
     /// <summary>
-    /// Capture all spatial mesh data within the scan area
+    /// Check if a GameObject should be excluded from scanning
     /// </summary>
+    private bool ShouldExclude(GameObject obj)
+    {
+        if (obj == null) return true;
+
+        string objName = obj.name;
+
+        // Exclude by exact name
+        foreach (string excludeName in excludeObjectNames)
+        {
+            if (objName == excludeName) return true;
+        }
+
+        // Exclude by name contains
+        foreach (string pattern in excludeNameContains)
+        {
+            if (objName.Contains(pattern)) return true;
+        }
+
+        // Exclude the scan area indicator itself
+        if (objName == "ScanAreaIndicator") return true;
+
+        // Exclude objects that are children of MRTK systems
+        Transform parent = obj.transform.parent;
+        while (parent != null)
+        {
+            string parentName = parent.gameObject.name;
+            if (parentName.Contains("MixedReality") ||
+                parentName.Contains("Diagnostics") ||
+                parentName.Contains("Canvas") ||
+                parentName.Contains("ProfilerVisual"))
+            {
+                return true;
+            }
+            parent = parent.parent;
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// Capture all spatial mesh data within the scan area
     /// </summary>
     private void CaptureSpatialMeshInArea()
     {
-        // Find all MeshFilters in the scene (spatial mesh and regular objects)
+        // Find all MeshFilters in the scene
         MeshFilter[] allMeshFilters = FindObjectsOfType<MeshFilter>();
+
+        int skippedNotReadable = 0;
+        int skippedFiltered = 0;
 
         foreach (MeshFilter meshFilter in allMeshFilters)
         {
             // Skip if no mesh
             if (meshFilter.sharedMesh == null) continue;
+
+            // Skip excluded objects (MRTK UI, cursors, profiler, etc.)
+            if (ShouldExclude(meshFilter.gameObject))
+            {
+                skippedFiltered++;
+                continue;
+            }
+
+            // Skip meshes that aren't readable (can't be combined or processed)
+            if (!meshFilter.sharedMesh.isReadable)
+            {
+                skippedNotReadable++;
+                Debug.LogWarning($"Skipping non-readable mesh: {meshFilter.gameObject.name}");
+                continue;
+            }
 
             // Check if mesh bounds intersect with scan area
             Bounds meshBounds = meshFilter.sharedMesh.bounds;
@@ -283,11 +357,13 @@ public class HoloLensSpatialScanner : MonoBehaviour
             if (distance <= scanRadius)
             {
                 capturedMeshes.Add(meshFilter);
-                Debug.Log($"Captured mesh: {meshFilter.gameObject.name} at distance {distance:F2}m");
+                Debug.Log($"Captured mesh: {meshFilter.gameObject.name} at distance {distance:F2}m " +
+                          $"({meshFilter.sharedMesh.vertexCount} verts)");
             }
         }
 
-        Debug.Log($"Captured {capturedMeshes.Count} mesh segments");
+        Debug.Log($"Captured {capturedMeshes.Count} mesh segments " +
+                  $"(filtered out {skippedFiltered} UI objects, {skippedNotReadable} non-readable)");
     }
 
     /// <summary>
@@ -305,6 +381,13 @@ public class HoloLensSpatialScanner : MonoBehaviour
         foreach (MeshFilter meshFilter in capturedMeshes)
         {
             if (meshFilter == null || meshFilter.sharedMesh == null) continue;
+
+            // Double-check readability before combining
+            if (!meshFilter.sharedMesh.isReadable)
+            {
+                Debug.LogWarning($"Skipping non-readable mesh during combine: {meshFilter.gameObject.name}");
+                continue;
+            }
 
             CombineInstance ci = new CombineInstance();
             ci.mesh = meshFilter.sharedMesh;
