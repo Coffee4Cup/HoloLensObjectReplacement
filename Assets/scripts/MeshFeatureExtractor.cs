@@ -37,7 +37,7 @@ public class MeshFeatures
     
     // Category hints (for faster search)
     public string suggestedCategory; // "appliance", "furniture", etc.
-    
+
     public override string ToString()
     {
         return $"BBox: {boundingBoxSize}, Volume: {volume:F3}, Area: {surfaceArea:F3}, Compactness: {compactness:F3}";
@@ -335,42 +335,79 @@ public class MeshFeatureExtractor : MonoBehaviour
 
     /// <summary>
     /// Compare two feature sets and return similarity score (0-1, higher = more similar)
+    /// FIXED: Uses bounded scoring functions that cannot go negative
     /// </summary>
     public float CompareFeaturesSimple(MeshFeatures f1, MeshFeatures f2)
     {
         float score = 0f;
         int weights = 0;
-        
-        // Compare bounding box ratios (weight: 3)
-        float sizeScore = 1f - Mathf.Abs(f1.aspectRatioXY - f2.aspectRatioXY) / 2f;
-        sizeScore += 1f - Mathf.Abs(f1.aspectRatioXZ - f2.aspectRatioXZ) / 2f;
-        sizeScore += 1f - Mathf.Abs(f1.aspectRatioYZ - f2.aspectRatioYZ) / 2f;
+
+        // Bounded similarity: 1/(1+|a-b|) -> always in [0,1]
+        System.Func<float, float, float> Similarity = (a, b) =>
+            1f / (1f + Mathf.Abs(a - b));
+
+        // Compare bounding box ratios using log-space (weight: 3)
+        // Log-space makes 2:1 and 1:2 equally penalised
+        float sizeScore = 0f;
+        sizeScore += Similarity(Mathf.Log(f1.aspectRatioXY + 0.001f),
+                                Mathf.Log(f2.aspectRatioXY + 0.001f));
+        sizeScore += Similarity(Mathf.Log(f1.aspectRatioXZ + 0.001f),
+                                Mathf.Log(f2.aspectRatioXZ + 0.001f));
+        sizeScore += Similarity(Mathf.Log(f1.aspectRatioYZ + 0.001f),
+                                Mathf.Log(f2.aspectRatioYZ + 0.001f));
         score += sizeScore;
         weights += 3;
-        
+
         // Compare compactness (weight: 2)
-        float compactnessScore = 1f - Mathf.Abs(f1.compactness - f2.compactness);
+        float compactnessScore = Similarity(f1.compactness, f2.compactness);
         score += compactnessScore * 2;
         weights += 2;
-        
-        // Compare volume distribution (weight: 2)
-        float distScore = 0f;
-        for (int i = 0; i < 8; i++)
-        {
-            distScore += 1f - Mathf.Abs(f1.volumeDistribution[i] - f2.volumeDistribution[i]);
-        }
-        score += (distScore / 8f) * 2;
+
+        // Compare sphericity (weight: 1)
+        float sphericityScore = Similarity(f1.sphericity, f2.sphericity);
+        score += sphericityScore;
+        weights += 1;
+
+        // Compare absolute bounding volume in log-space (weight: 2)
+        float vol1 = f1.boundingBoxSize.x * f1.boundingBoxSize.y * f1.boundingBoxSize.z;
+        float vol2 = f2.boundingBoxSize.x * f2.boundingBoxSize.y * f2.boundingBoxSize.z;
+        float absSizeScore = Similarity(Mathf.Log(vol1 + 0.0001f),
+                                        Mathf.Log(vol2 + 0.0001f));
+        score += absSizeScore * 2;
         weights += 2;
-        
-        // Compare shape histogram (weight: 3)
-        float histScore = 0f;
-        for (int i = 0; i < f1.shapeHistogram.Length; i++)
+
+        // Compare volume distribution (weight: 2)
+        if (f1.volumeDistribution != null && f2.volumeDistribution != null
+            && f1.volumeDistribution.Length >= 8 && f2.volumeDistribution.Length >= 8)
         {
-            histScore += 1f - Mathf.Abs(f1.shapeHistogram[i] - f2.shapeHistogram[i]);
+            float distScore = 0f;
+            for (int i = 0; i < 8; i++)
+            {
+                distScore += Similarity(f1.volumeDistribution[i], f2.volumeDistribution[i]);
+            }
+            score += (distScore / 8f) * 2;
+            weights += 2;
         }
-        score += (histScore / f1.shapeHistogram.Length) * 3;
-        weights += 3;
-        
-        return Mathf.Clamp01(score / weights);
+
+        // Compare shape histogram (weight: 3)
+        if (f1.shapeHistogram != null && f2.shapeHistogram != null
+            && f1.shapeHistogram.Length > 0 && f2.shapeHistogram.Length > 0)
+        {
+            int bins = Mathf.Min(f1.shapeHistogram.Length, f2.shapeHistogram.Length);
+            float histScore = 0f;
+            for (int i = 0; i < bins; i++)
+            {
+                histScore += Similarity(f1.shapeHistogram[i], f2.shapeHistogram[i]);
+            }
+            score += (histScore / bins) * 3;
+            weights += 3;
+        }
+
+        float finalScore = (weights > 0) ? score / weights : 0f;
+
+        Debug.Log($"[Compare] AspectRatio={sizeScore / 3f:F3}, Compact={compactnessScore:F3}, " +
+                  $"AbsSize={absSizeScore:F3}, Final={finalScore:F3}");
+
+        return Mathf.Clamp01(finalScore);
     }
 }

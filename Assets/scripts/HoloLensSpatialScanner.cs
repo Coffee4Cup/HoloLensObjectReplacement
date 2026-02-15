@@ -7,6 +7,7 @@ using System.Linq;
 /// Real spatial mesh scanner for HoloLens
 /// Captures mesh data from the environment using XR spatial mapping
 /// Works in Unity Editor XR Simulation AND on real HoloLens device
+/// FIXED: Less aggressive mesh filtering in CaptureSpatialMeshInArea
 /// </summary>
 public class HoloLensSpatialScanner : MonoBehaviour
 {
@@ -20,20 +21,6 @@ public class HoloLensSpatialScanner : MonoBehaviour
     [SerializeField] private GameObject boundingBoxPrefab;
     [SerializeField] private Material scanningMaterial;
     [SerializeField] private Color scanAreaColor = new Color(0, 1, 0, 0.3f);
-
-    [Header("Filtering")]
-    [SerializeField] private string[] excludeObjectNames = new string[]
-    {
-        "Cursor", "CursorFocus", "CursorRest", "CursorContextual",
-        "PeakBar", "UsedBar", "LimitBar", "Background",
-        "Sphere",  // The scan area indicator sphere
-        "statusText", "instructionText",
-        "MixedRealityToolkit", "MixedRealityPlayspace", "MixedRealitySceneContent"
-    };
-    [SerializeField] private string[] excludeNameContains = new string[]
-    {
-        "Cursor", "Bar", "Tooltip", "Diagnostics", "Profile", "Canvas", "Panel", "UI"
-    };
 
     [Header("Keyboard Controls (Editor Testing)")]
     [SerializeField] private KeyCode startScanKey = KeyCode.S;
@@ -166,7 +153,6 @@ public class HoloLensSpatialScanner : MonoBehaviour
         {
             // Create simple sphere to show scan area if no prefab
             boundingBoxInstance = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            boundingBoxInstance.name = "ScanAreaIndicator";
             boundingBoxInstance.transform.position = center;
             boundingBoxInstance.transform.localScale = Vector3.one * scanRadius * 2;
 
@@ -234,16 +220,14 @@ public class HoloLensSpatialScanner : MonoBehaviour
         {
             combinedMesh = CombineCapturedMeshes();
 
-            if (combinedMesh != null && combinedMesh.vertexCount > 0)
+            if (combinedMesh != null)
             {
                 Debug.Log($"Scan complete! Captured mesh with {combinedMesh.vertexCount} vertices");
                 OnScanComplete?.Invoke(combinedMesh);
             }
             else
             {
-                Debug.LogWarning("Combined mesh was empty. Creating fallback test mesh.");
-                combinedMesh = CreateFallbackMesh();
-                OnScanComplete?.Invoke(combinedMesh);
+                Debug.LogError("Failed to combine captured meshes");
             }
         }
         else
@@ -276,94 +260,85 @@ public class HoloLensSpatialScanner : MonoBehaviour
     }
 
     /// <summary>
-    /// Check if a GameObject should be excluded from scanning
-    /// </summary>
-    private bool ShouldExclude(GameObject obj)
-    {
-        if (obj == null) return true;
-
-        string objName = obj.name;
-
-        // Exclude by exact name
-        foreach (string excludeName in excludeObjectNames)
-        {
-            if (objName == excludeName) return true;
-        }
-
-        // Exclude by name contains
-        foreach (string pattern in excludeNameContains)
-        {
-            if (objName.Contains(pattern)) return true;
-        }
-
-        // Exclude the scan area indicator itself
-        if (objName == "ScanAreaIndicator") return true;
-
-        // Exclude objects that are children of MRTK systems
-        Transform parent = obj.transform.parent;
-        while (parent != null)
-        {
-            string parentName = parent.gameObject.name;
-            if (parentName.Contains("MixedReality") ||
-                parentName.Contains("Diagnostics") ||
-                parentName.Contains("Canvas") ||
-                parentName.Contains("ProfilerVisual"))
-            {
-                return true;
-            }
-            parent = parent.parent;
-        }
-
-        return false;
-    }
-
-    /// <summary>
     /// Capture all spatial mesh data within the scan area
+    /// FIXED: Only skips the scanner's own visual objects and actual UI elements.
+    /// Uses world-space renderer bounds for accurate distance checks.
     /// </summary>
     private void CaptureSpatialMeshInArea()
     {
-        // Find all MeshFilters in the scene
         MeshFilter[] allMeshFilters = FindObjectsOfType<MeshFilter>();
 
-        int skippedNotReadable = 0;
-        int skippedFiltered = 0;
+        int filteredUI = 0;
+        int filteredNonReadable = 0;
+        int filteredTooSmall = 0;
 
         foreach (MeshFilter meshFilter in allMeshFilters)
         {
             // Skip if no mesh
             if (meshFilter.sharedMesh == null) continue;
 
-            // Skip excluded objects (MRTK UI, cursors, profiler, etc.)
-            if (ShouldExclude(meshFilter.gameObject))
+            // Skip the scanner's own bounding box visualisation
+            if (boundingBoxInstance != null &&
+                meshFilter.transform.IsChildOf(boundingBoxInstance.transform))
             {
-                skippedFiltered++;
+                filteredUI++;
                 continue;
             }
 
-            // Skip meshes that aren't readable (can't be combined or processed)
+            // Skip UI canvases and TextMeshPro objects
+            if (meshFilter.GetComponentInParent<Canvas>() != null ||
+                meshFilter.GetComponentInParent<TMPro.TMP_Text>() != null)
+            {
+                filteredUI++;
+                continue;
+            }
+
+            // Skip meshes that aren't readable (can't combine them)
             if (!meshFilter.sharedMesh.isReadable)
             {
-                skippedNotReadable++;
-                Debug.LogWarning($"Skipping non-readable mesh: {meshFilter.gameObject.name}");
+                filteredNonReadable++;
                 continue;
             }
 
-            // Check if mesh bounds intersect with scan area
-            Bounds meshBounds = meshFilter.sharedMesh.bounds;
-            Vector3 worldCenter = meshFilter.transform.TransformPoint(meshBounds.center);
-
-            float distance = Vector3.Distance(worldCenter, scanCenter);
-
-            if (distance <= scanRadius)
+            // Use world-space renderer bounds if available (more accurate)
+            Bounds meshBounds;
+            Renderer rend = meshFilter.GetComponent<Renderer>();
+            if (rend != null)
             {
-                capturedMeshes.Add(meshFilter);
-                Debug.Log($"Captured mesh: {meshFilter.gameObject.name} at distance {distance:F2}m " +
-                          $"({meshFilter.sharedMesh.vertexCount} verts)");
+                meshBounds = rend.bounds;
             }
+            else
+            {
+                meshBounds = new Bounds(
+                    meshFilter.transform.TransformPoint(meshFilter.sharedMesh.bounds.center),
+                    meshFilter.sharedMesh.bounds.size);
+            }
+
+            float distance = Vector3.Distance(meshBounds.center, scanCenter);
+
+            if (distance > scanRadius)
+            {
+                continue;
+            }
+
+            // Skip very tiny meshes (likely debris / noise, < 1cm)
+            float maxExtent = Mathf.Max(meshBounds.extents.x,
+                                         meshBounds.extents.y,
+                                         meshBounds.extents.z);
+            if (maxExtent < 0.01f)
+            {
+                filteredTooSmall++;
+                continue;
+            }
+
+            capturedMeshes.Add(meshFilter);
+            Debug.Log($"Captured mesh: {meshFilter.gameObject.name} at distance {distance:F2}m " +
+                      $"({meshFilter.sharedMesh.vertexCount} verts)");
         }
 
         Debug.Log($"Captured {capturedMeshes.Count} mesh segments " +
-                  $"(filtered out {skippedFiltered} UI objects, {skippedNotReadable} non-readable)");
+                  $"(filtered out {filteredUI} UI objects, {filteredNonReadable} non-readable, " +
+                  $"{filteredTooSmall} too small)");
     }
 
     /// <summary>
@@ -381,13 +356,6 @@ public class HoloLensSpatialScanner : MonoBehaviour
         foreach (MeshFilter meshFilter in capturedMeshes)
         {
             if (meshFilter == null || meshFilter.sharedMesh == null) continue;
-
-            // Double-check readability before combining
-            if (!meshFilter.sharedMesh.isReadable)
-            {
-                Debug.LogWarning($"Skipping non-readable mesh during combine: {meshFilter.gameObject.name}");
-                continue;
-            }
 
             CombineInstance ci = new CombineInstance();
             ci.mesh = meshFilter.sharedMesh;

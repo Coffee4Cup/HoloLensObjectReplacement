@@ -6,6 +6,7 @@ using TMPro;
 /// <summary>
 /// Production workflow controller for HoloLens
 /// Uses real spatial scanning instead of test meshes
+/// FIXED: Lowered threshold, added diagnostics, better error messages
 /// </summary>
 public class HoloLensWorkflowController : MonoBehaviour
 {
@@ -22,7 +23,7 @@ public class HoloLensWorkflowController : MonoBehaviour
     
     [Header("Settings")]
     [SerializeField] private int topSearchResults = 5;
-    [SerializeField] private float minimumSimilarityScore = 0.3f;
+    [SerializeField] private float minimumSimilarityScore = 0.15f; // FIXED: was 0.3f — too high for partial scans
     [SerializeField] private bool autoSelectBestMatch = true;
 
     [Header("Keyboard Controls (Editor Testing)")]
@@ -157,6 +158,7 @@ public class HoloLensWorkflowController : MonoBehaviour
 
     /// <summary>
     /// Process scanned mesh and search for matches
+    /// FIXED: Added diagnostic logging, reports scores even on failure
     /// </summary>
     private IEnumerator ProcessAndMatch()
     {
@@ -189,25 +191,66 @@ public class HoloLensWorkflowController : MonoBehaviour
         }
         
         Debug.Log($"Features extracted: {scannedFeatures}");
+        Debug.Log($"[DIAG] Scanned BBox: {scannedFeatures.boundingBoxSize}, " +
+                  $"Volume: {scannedFeatures.volume:F4}, " +
+                  $"Compactness: {scannedFeatures.compactness:F3}, " +
+                  $"Category: {scannedFeatures.suggestedCategory}");
+
+        // Warn if scan looks suspicious (very flat or tiny)
+        Vector3 bbox = scannedFeatures.boundingBoxSize;
+        float minDim = Mathf.Min(bbox.x, bbox.y, bbox.z);
+        float maxDim = Mathf.Max(bbox.x, bbox.y, bbox.z);
+        if (minDim < 0.05f || maxDim < 0.1f)
+        {
+            Debug.LogWarning($"[DIAG] Scanned mesh looks very thin or small! " +
+                             $"Min dimension: {minDim:F3}m, Max dimension: {maxDim:F3}m. " +
+                             $"The scan may have missed the real object.");
+        }
 
         // Search database
         currentState = WorkflowState.Searching;
         UpdateStatus("Searching for matches...");
         yield return new WaitForSeconds(0.3f);
         
-        searchResults = modelDatabase.SearchSimilar(scannedFeatures, topSearchResults);
-        searchResults = searchResults.FindAll(r => r.similarityScore >= minimumSimilarityScore);
+        // Get ALL results first (unfiltered) so we can diagnose
+        List<SearchResult> allResults = modelDatabase.SearchSimilar(scannedFeatures, topSearchResults);
+
+        // Log all scores for debugging
+        Debug.Log($"[DIAG] Database returned {allResults.Count} results (before threshold filter):");
+        for (int i = 0; i < allResults.Count; i++)
+        {
+            var r = allResults[i];
+            Debug.Log($"[DIAG]   {i + 1}. {r.model.name} — score: {r.similarityScore:F3} — {r.matchReason}");
+            if (r.model.features != null)
+            {
+                Debug.Log($"[DIAG]      DB BBox: {r.model.features.boundingBoxSize}, " +
+                          $"Volume: {r.model.features.volume:F4}, " +
+                          $"Compactness: {r.model.features.compactness:F3}");
+            }
+            else
+            {
+                Debug.LogWarning($"[DIAG]      DB entry '{r.model.name}' has NULL features! " +
+                                 "Database may have failed to serialize/deserialize.");
+            }
+        }
+
+        // Now apply threshold filter
+        searchResults = allResults.FindAll(r => r.similarityScore >= minimumSimilarityScore);
         
         if (searchResults.Count == 0)
         {
-            UpdateStatus("No matches found");
-            UpdateInstructions("No similar objects in database. Press R to try again.");
-            Debug.LogWarning("No models found matching criteria");
+            float bestScore = allResults.Count > 0 ? allResults[0].similarityScore : 0f;
+            string bestName = allResults.Count > 0 ? allResults[0].model.name : "N/A";
+
+            UpdateStatus($"No matches found (best: {bestName} at {bestScore:F3}, need >= {minimumSimilarityScore:F2})");
+            UpdateInstructions("Try scanning closer to the object, or lower the similarity threshold. Press R to retry.");
+            Debug.LogWarning($"No models above threshold {minimumSimilarityScore}. " +
+                             $"Best was '{bestName}' at {bestScore:F3}");
             currentState = WorkflowState.Idle;
             yield break;
         }
         
-        Debug.Log($"Found {searchResults.Count} matching models");
+        Debug.Log($"Found {searchResults.Count} matching models above threshold {minimumSimilarityScore}");
 
         // Display results
         currentState = WorkflowState.DisplayingResults;
