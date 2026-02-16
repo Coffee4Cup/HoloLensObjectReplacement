@@ -222,6 +222,30 @@ public class SimpleWorkflowController : MonoBehaviour
             Debug.LogWarning("Alignment failed, model placed at default position");
         }
 
+        // Scale the model AFTER alignment (alignment overwrites localScale)
+        Renderer modelRenderer = virtualModel.GetComponentInChildren<Renderer>();
+        if (modelRenderer != null)
+        {
+            Vector3 currentWorldSize = modelRenderer.bounds.size;
+            Vector3 targetSize = modelEntry.features != null ? modelEntry.features.boundingBoxSize : scannedFeatures.boundingBoxSize;
+
+            if (targetSize.x < 0.01f || targetSize.y < 0.01f || targetSize.z < 0.01f)
+            {
+                targetSize = scannedFeatures.boundingBoxSize;
+                Debug.LogWarning("[Scale] DB entry has invalid size, using scanned size as fallback");
+            }
+
+            float scaleX = (currentWorldSize.x > 0.001f) ? targetSize.x / currentWorldSize.x : 1f;
+            float scaleY = (currentWorldSize.y > 0.001f) ? targetSize.y / currentWorldSize.y : 1f;
+            float scaleZ = (currentWorldSize.z > 0.001f) ? targetSize.z / currentWorldSize.z : 1f;
+
+            float uniformScale = (scaleX + scaleY + scaleZ) / 3f;
+            virtualModel.transform.localScale *= uniformScale;
+
+            Debug.Log($"[Scale] World size after align: {currentWorldSize}, Target size: {targetSize}, " +
+                      $"Applied uniform scale: {uniformScale:F3}");
+        }
+
         overlayedModel = virtualModel;
         currentState = WorkflowState.Complete;
         

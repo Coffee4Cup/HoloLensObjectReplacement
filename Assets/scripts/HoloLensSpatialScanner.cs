@@ -5,17 +5,19 @@ using System.Linq;
 
 /// <summary>
 /// Real spatial mesh scanner for HoloLens
-/// Captures mesh data from the environment using XR spatial mapping
-/// Works in Unity Editor XR Simulation AND on real HoloLens device
-/// FIXED: Less aggressive mesh filtering in CaptureSpatialMeshInArea
+/// Auto-excludes objects tagged "DatabaseModel" and name-matched washing machines
 /// </summary>
 public class HoloLensSpatialScanner : MonoBehaviour
 {
     [Header("Scanning Settings")]
     [SerializeField] private float scanRadius = 2f;
-    [SerializeField] private float minObjectSize = 0.3f; // Minimum size to be considered
-    [SerializeField] private float scanDuration = 5f; // How long to scan
+    [SerializeField] private float minObjectSize = 0.3f;
+    [SerializeField] private float scanDuration = 5f;
     [SerializeField] private LayerMask spatialMeshLayer;
+
+    [Header("Exclusion Settings")]
+    [SerializeField] private string excludeTag = "DatabaseModel";
+    [SerializeField] private List<GameObject> excludeFromScan = new List<GameObject>();
 
     [Header("Visual Feedback")]
     [SerializeField] private GameObject boundingBoxPrefab;
@@ -27,121 +29,110 @@ public class HoloLensSpatialScanner : MonoBehaviour
     [SerializeField] private KeyCode completeScanKey = KeyCode.C;
     [SerializeField] private KeyCode cancelScanKey = KeyCode.X;
 
-    // State
     private bool isScanning = false;
     private float scanStartTime;
     private Vector3 scanCenter;
     private Bounds targetBounds;
     private GameObject boundingBoxInstance;
     private List<MeshFilter> capturedMeshes = new List<MeshFilter>();
-
-    // Mesh data
     private Mesh combinedMesh;
+    private bool tagExists = false;
 
-    // Events
     public delegate void ScanCompleteHandler(Mesh scannedMesh);
     public event ScanCompleteHandler OnScanComplete;
-
     public delegate void ScanProgressHandler(float progress);
     public event ScanProgressHandler OnScanProgress;
 
     void Start()
     {
         Debug.Log("HoloLensSpatialScanner initialized - Ready for HoloLens!");
+        if (spatialMeshLayer == 0) spatialMeshLayer = LayerMask.GetMask("Default");
 
-        // Set default layer if not set
-        if (spatialMeshLayer == 0)
+        try { GameObject.FindGameObjectsWithTag(excludeTag); tagExists = true; }
+        catch (UnityException) { tagExists = false; }
+        
+        // Auto-find scene washing machines and add to exclude list
+        AutoExcludeSceneModels();
+    }
+
+    /// <summary>
+    /// Automatically find and exclude all washing machine objects in the scene
+    /// </summary>
+    private void AutoExcludeSceneModels()
+    {
+        // Find by name pattern
+        string[] patterns = { "washingmachine", "washing_machine", "washer" };
+        foreach (GameObject go in FindObjectsOfType<GameObject>())
         {
-            spatialMeshLayer = LayerMask.GetMask("Default");
+            string nameLower = go.name.ToLower();
+            foreach (string pattern in patterns)
+            {
+                if (nameLower.Contains(pattern))
+                {
+                    // Add the root of this object (not children individually)
+                    Transform root = go.transform;
+                    while (root.parent != null && root.parent.name.ToLower().Contains(pattern))
+                        root = root.parent;
+                    
+                    if (!excludeFromScan.Contains(root.gameObject))
+                    {
+                        excludeFromScan.Add(root.gameObject);
+                        Debug.Log($"[Scanner] Auto-excluding '{root.name}' (DB model)");
+                    }
+                    break;
+                }
+            }
         }
+        
+        Debug.Log($"[Scanner] Total excluded objects: {excludeFromScan.Count}");
     }
 
     void Update()
     {
-        // Keyboard controls for testing in Unity Editor
-        if (Input.GetKeyDown(startScanKey) && !isScanning)
-        {
-            StartScanningAtGaze();
-        }
+        if (Input.GetKeyDown(startScanKey) && !isScanning) StartScanningAtGaze();
+        if (Input.GetKeyDown(completeScanKey) && isScanning) CompleteScan();
+        if (Input.GetKeyDown(cancelScanKey) && isScanning) CancelScan();
+        if (isScanning) UpdateScanProgress();
+    }
 
-        if (Input.GetKeyDown(completeScanKey) && isScanning)
+    public void ExcludeObject(GameObject obj)
+    {
+        if (obj != null && !excludeFromScan.Contains(obj))
         {
-            CompleteScan();
-        }
-
-        if (Input.GetKeyDown(cancelScanKey) && isScanning)
-        {
-            CancelScan();
-        }
-
-        // Update scanning progress
-        if (isScanning)
-        {
-            UpdateScanProgress();
+            excludeFromScan.Add(obj);
+            Debug.Log($"[Scanner] Excluding '{obj.name}' from scan");
         }
     }
 
-    /// <summary>
-    /// Start scanning at the user's gaze point
-    /// </summary>
     public void StartScanningAtGaze()
     {
-        // Get gaze ray (from camera forward)
         Ray gazeRay = new Ray(Camera.main.transform.position, Camera.main.transform.forward);
         RaycastHit hit;
-
-        // Try to hit spatial mesh or any object
         if (Physics.Raycast(gazeRay, out hit, scanRadius * 2, spatialMeshLayer))
-        {
             StartScanningAtPoint(hit.point);
-        }
         else
-        {
-            // If no hit, scan at default distance
-            Vector3 defaultPoint = Camera.main.transform.position + Camera.main.transform.forward * 2f;
-            StartScanningAtPoint(defaultPoint);
-        }
+            StartScanningAtPoint(Camera.main.transform.position + Camera.main.transform.forward * 2f);
     }
 
-    /// <summary>
-    /// Start scanning at a specific world position
-    /// </summary>
     public void StartScanningAtPoint(Vector3 centerPoint)
     {
-        if (isScanning)
-        {
-            Debug.LogWarning("Already scanning!");
-            return;
-        }
-
+        if (isScanning) { Debug.LogWarning("Already scanning!"); return; }
         isScanning = true;
         scanStartTime = Time.time;
         scanCenter = centerPoint;
         capturedMeshes.Clear();
-
-        // Create bounding box for visual feedback
         CreateScanBoundingBox(centerPoint);
-
         Debug.Log($"Started scanning at {centerPoint}");
-        Debug.Log($"Walk around the object for {scanDuration} seconds, then press {completeScanKey} or say 'Complete'");
     }
 
-    /// <summary>
-    /// Create visual bounding box to show scan area
-    /// </summary>
     private void CreateScanBoundingBox(Vector3 center)
     {
-        if (boundingBoxInstance != null)
-        {
-            Destroy(boundingBoxInstance);
-        }
+        if (boundingBoxInstance != null) Destroy(boundingBoxInstance);
 
         if (boundingBoxPrefab != null)
         {
             boundingBoxInstance = Instantiate(boundingBoxPrefab, center, Quaternion.identity);
             boundingBoxInstance.transform.localScale = Vector3.one * scanRadius;
-
-            // Make it semi-transparent green to show scan area
             Renderer renderer = boundingBoxInstance.GetComponentInChildren<Renderer>();
             if (renderer != null && scanningMaterial != null)
             {
@@ -151,15 +142,13 @@ public class HoloLensSpatialScanner : MonoBehaviour
         }
         else
         {
-            // Create simple sphere to show scan area if no prefab
             boundingBoxInstance = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             boundingBoxInstance.transform.position = center;
             boundingBoxInstance.transform.localScale = Vector3.one * scanRadius * 2;
-
             Renderer renderer = boundingBoxInstance.GetComponent<Renderer>();
             Material mat = new Material(Shader.Find("Standard"));
             mat.color = scanAreaColor;
-            mat.SetFloat("_Mode", 3); // Transparent
+            mat.SetFloat("_Mode", 3);
             mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
             mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
             mat.SetInt("_ZWrite", 0);
@@ -168,23 +157,15 @@ public class HoloLensSpatialScanner : MonoBehaviour
             mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
             mat.renderQueue = 3000;
             renderer.material = mat;
-
-            // Remove collider
             Destroy(boundingBoxInstance.GetComponent<Collider>());
         }
     }
 
-    /// <summary>
-    /// Update scan progress
-    /// </summary>
     private void UpdateScanProgress()
     {
         float elapsed = Time.time - scanStartTime;
         float progress = Mathf.Clamp01(elapsed / scanDuration);
-
         OnScanProgress?.Invoke(progress);
-
-        // Auto-complete if duration reached
         if (elapsed >= scanDuration)
         {
             Debug.Log("Scan duration completed - auto-completing");
@@ -192,261 +173,164 @@ public class HoloLensSpatialScanner : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Complete the scan and process captured data
-    /// </summary>
     public void CompleteScan()
     {
-        if (!isScanning)
-        {
-            Debug.LogWarning("Not currently scanning!");
-            return;
-        }
-
+        if (!isScanning) { Debug.LogWarning("Not currently scanning!"); return; }
         Debug.Log("Completing scan...");
         isScanning = false;
+        if (boundingBoxInstance != null) Destroy(boundingBoxInstance);
 
-        // Clean up visual feedback
-        if (boundingBoxInstance != null)
-        {
-            Destroy(boundingBoxInstance);
-        }
-
-        // Capture spatial mesh in the scan area
         CaptureSpatialMeshInArea();
 
-        // Process and combine the meshes
         if (capturedMeshes.Count > 0)
         {
             combinedMesh = CombineCapturedMeshes();
-
             if (combinedMesh != null)
             {
                 Debug.Log($"Scan complete! Captured mesh with {combinedMesh.vertexCount} vertices");
                 OnScanComplete?.Invoke(combinedMesh);
             }
-            else
-            {
-                Debug.LogError("Failed to combine captured meshes");
-            }
+            else Debug.LogError("Failed to combine captured meshes");
         }
         else
         {
-            Debug.LogWarning("No spatial mesh data captured. Creating fallback test mesh.");
+            Debug.LogWarning("No spatial mesh data captured in range. Using fallback.");
             combinedMesh = CreateFallbackMesh();
             OnScanComplete?.Invoke(combinedMesh);
         }
     }
 
-    /// <summary>
-    /// Cancel the current scan
-    /// </summary>
     public void CancelScan()
     {
-        if (!isScanning)
-        {
-            Debug.LogWarning("Not currently scanning!");
-            return;
-        }
-
+        if (!isScanning) { Debug.LogWarning("Not currently scanning!"); return; }
         Debug.Log("Scan cancelled");
         isScanning = false;
         capturedMeshes.Clear();
-
-        if (boundingBoxInstance != null)
-        {
-            Destroy(boundingBoxInstance);
-        }
+        if (boundingBoxInstance != null) Destroy(boundingBoxInstance);
     }
 
-    /// <summary>
-    /// Capture all spatial mesh data within the scan area
-    /// FIXED: Only skips the scanner's own visual objects and actual UI elements.
-    /// Uses world-space renderer bounds for accurate distance checks.
-    /// </summary>
+    private bool IsExcluded(GameObject go)
+    {
+        // Check tag on self and parents
+        if (tagExists)
+        {
+            Transform t = go.transform;
+            while (t != null)
+            {
+                try { if (t.CompareTag(excludeTag)) return true; } catch { }
+                t = t.parent;
+            }
+        }
+
+        // Check manual exclude list (includes auto-excluded)
+        foreach (GameObject excludeObj in excludeFromScan)
+        {
+            if (excludeObj != null &&
+                (go == excludeObj || go.transform.IsChildOf(excludeObj.transform)))
+                return true;
+        }
+
+        return false;
+    }
+
     private void CaptureSpatialMeshInArea()
     {
         MeshFilter[] allMeshFilters = FindObjectsOfType<MeshFilter>();
-
-        int filteredUI = 0;
-        int filteredNonReadable = 0;
-        int filteredTooSmall = 0;
+        int filteredDB = 0, filteredUI = 0, filteredNonReadable = 0, filteredTooSmall = 0;
 
         foreach (MeshFilter meshFilter in allMeshFilters)
         {
-            // Skip if no mesh
             if (meshFilter.sharedMesh == null) continue;
 
-            // Skip the scanner's own bounding box visualisation
             if (boundingBoxInstance != null &&
                 meshFilter.transform.IsChildOf(boundingBoxInstance.transform))
-            {
-                filteredUI++;
-                continue;
-            }
+            { filteredUI++; continue; }
 
-            // Skip UI canvases and TextMeshPro objects
+            if (IsExcluded(meshFilter.gameObject))
+            { filteredDB++; continue; }
+
             if (meshFilter.GetComponentInParent<Canvas>() != null ||
                 meshFilter.GetComponentInParent<TMPro.TMP_Text>() != null)
-            {
-                filteredUI++;
-                continue;
-            }
+            { filteredUI++; continue; }
 
-            // Skip meshes that aren't readable (can't combine them)
             if (!meshFilter.sharedMesh.isReadable)
-            {
-                filteredNonReadable++;
-                continue;
-            }
+            { filteredNonReadable++; continue; }
 
-            // Use world-space renderer bounds if available (more accurate)
             Bounds meshBounds;
             Renderer rend = meshFilter.GetComponent<Renderer>();
-            if (rend != null)
-            {
-                meshBounds = rend.bounds;
-            }
-            else
-            {
-                meshBounds = new Bounds(
-                    meshFilter.transform.TransformPoint(meshFilter.sharedMesh.bounds.center),
-                    meshFilter.sharedMesh.bounds.size);
-            }
+            if (rend != null) meshBounds = rend.bounds;
+            else meshBounds = new Bounds(
+                meshFilter.transform.TransformPoint(meshFilter.sharedMesh.bounds.center),
+                meshFilter.sharedMesh.bounds.size);
 
             float distance = Vector3.Distance(meshBounds.center, scanCenter);
+            if (distance > scanRadius) continue;
 
-            if (distance > scanRadius)
-            {
-                continue;
-            }
-
-            // Skip very tiny meshes (likely debris / noise, < 1cm)
-            float maxExtent = Mathf.Max(meshBounds.extents.x,
-                                         meshBounds.extents.y,
-                                         meshBounds.extents.z);
-            if (maxExtent < 0.01f)
-            {
-                filteredTooSmall++;
-                continue;
-            }
+            float maxExtent = Mathf.Max(meshBounds.extents.x, meshBounds.extents.y, meshBounds.extents.z);
+            if (maxExtent < 0.01f) { filteredTooSmall++; continue; }
 
             capturedMeshes.Add(meshFilter);
-            Debug.Log($"Captured mesh: {meshFilter.gameObject.name} at distance {distance:F2}m " +
-                      $"({meshFilter.sharedMesh.vertexCount} verts)");
+            Debug.Log($"[Scan] Captured: {meshFilter.gameObject.name} " +
+                      $"({meshFilter.sharedMesh.vertexCount} verts, dist={distance:F2}m, " +
+                      $"worldSize={meshBounds.size})");
         }
 
-        Debug.Log($"Captured {capturedMeshes.Count} mesh segments " +
-                  $"(filtered out {filteredUI} UI objects, {filteredNonReadable} non-readable, " +
-                  $"{filteredTooSmall} too small)");
+        Debug.Log($"[Scan] Result: {capturedMeshes.Count} captured | " +
+                  $"Excluded: {filteredDB} DB models, {filteredUI} UI, " +
+                  $"{filteredNonReadable} non-readable, {filteredTooSmall} too small");
     }
 
-    /// <summary>
-    /// Combine all captured meshes into one
-    /// </summary>
     private Mesh CombineCapturedMeshes()
     {
-        if (capturedMeshes.Count == 0)
-        {
-            return null;
-        }
-
+        if (capturedMeshes.Count == 0) return null;
         List<CombineInstance> combineInstances = new List<CombineInstance>();
-
-        foreach (MeshFilter meshFilter in capturedMeshes)
+        foreach (MeshFilter mf in capturedMeshes)
         {
-            if (meshFilter == null || meshFilter.sharedMesh == null) continue;
-
+            if (mf == null || mf.sharedMesh == null) continue;
             CombineInstance ci = new CombineInstance();
-            ci.mesh = meshFilter.sharedMesh;
-            ci.transform = meshFilter.transform.localToWorldMatrix;
+            ci.mesh = mf.sharedMesh;
+            ci.transform = mf.transform.localToWorldMatrix;
             combineInstances.Add(ci);
         }
-
-        if (combineInstances.Count == 0)
-        {
-            return null;
-        }
-
+        if (combineInstances.Count == 0) return null;
         Mesh combined = new Mesh();
         combined.CombineMeshes(combineInstances.ToArray(), true, true);
         combined.RecalculateNormals();
         combined.RecalculateBounds();
-
         return combined;
     }
 
-    /// <summary>
-    /// Create fallback test mesh if no spatial data available
-    /// </summary>
     private Mesh CreateFallbackMesh()
     {
-        // Create a simple box mesh as fallback (for testing without spatial mapping)
         Mesh mesh = new Mesh();
-
-        float w = 0.6f, h = 1.2f, d = 0.7f; // Washing machine size
-
-        Vector3[] vertices = new Vector3[]
-        {
-            new Vector3(-w/2, 0, d/2), new Vector3(w/2, 0, d/2), new Vector3(w/2, h, d/2), new Vector3(-w/2, h, d/2),
-            new Vector3(-w/2, 0, -d/2), new Vector3(w/2, 0, -d/2), new Vector3(w/2, h, -d/2), new Vector3(-w/2, h, -d/2)
+        float w = 0.6f, h = 1.2f, d = 0.7f;
+        Vector3[] verts = new Vector3[] {
+            new Vector3(-w/2,0,d/2), new Vector3(w/2,0,d/2), new Vector3(w/2,h,d/2), new Vector3(-w/2,h,d/2),
+            new Vector3(-w/2,0,-d/2), new Vector3(w/2,0,-d/2), new Vector3(w/2,h,-d/2), new Vector3(-w/2,h,-d/2)
         };
-
-        int[] triangles = new int[]
-        {
-            0, 2, 1, 0, 3, 2,
-            5, 6, 4, 6, 7, 4,
-            4, 7, 0, 7, 3, 0,
-            1, 2, 5, 2, 6, 5,
-            3, 7, 2, 7, 6, 2,
-            4, 0, 5, 0, 1, 5
-        };
-
-        mesh.vertices = vertices;
-        mesh.triangles = triangles;
+        int[] tris = { 0,2,1, 0,3,2, 5,6,4, 6,7,4, 4,7,0, 7,3,0, 1,2,5, 2,6,5, 3,7,2, 7,6,2, 4,0,5, 0,1,5 };
+        mesh.vertices = verts;
+        mesh.triangles = tris;
         mesh.RecalculateNormals();
         mesh.RecalculateBounds();
-
-        Debug.Log("Created fallback mesh (no spatial data available)");
-
+        Debug.Log("Created fallback mesh (washing machine size 0.6×1.2×0.7)");
         return mesh;
     }
 
-    /// <summary>
-    /// Get the most recently scanned mesh
-    /// </summary>
-    public Mesh GetScannedMesh()
-    {
-        return combinedMesh;
-    }
-
-    /// <summary>
-    /// Check if currently scanning
-    /// </summary>
-    public bool IsScanning()
-    {
-        return isScanning;
-    }
-
-    /// <summary>
-    /// Get scan progress (0-1)
-    /// </summary>
+    public Mesh GetScannedMesh() { return combinedMesh; }
+    public bool IsScanning() { return isScanning; }
     public float GetScanProgress()
     {
         if (!isScanning) return 0f;
-
-        float elapsed = Time.time - scanStartTime;
-        return Mathf.Clamp01(elapsed / scanDuration);
+        return Mathf.Clamp01((Time.time - scanStartTime) / scanDuration);
     }
 
-    // Visualization
     void OnDrawGizmos()
     {
         if (isScanning)
         {
             Gizmos.color = Color.green;
             Gizmos.DrawWireSphere(scanCenter, scanRadius);
-
             Gizmos.color = new Color(0, 1, 0, 0.1f);
             Gizmos.DrawSphere(scanCenter, scanRadius);
         }

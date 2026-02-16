@@ -163,7 +163,7 @@ public class ModelDatabase : MonoBehaviour
 
     /// <summary>
     /// Add a new model to the database
-    /// FIXED: Converts Dictionary metadata to serializable format
+    /// FIXED: Instantiates prefab temporarily to get correct world-space bounds
     /// </summary>
     public void AddModel(GameObject modelObject, string name, string category, Dictionary<string, string> meta = null)
     {
@@ -173,18 +173,58 @@ public class ModelDatabase : MonoBehaviour
             return;
         }
 
-        MeshFilter meshFilter = modelObject.GetComponentInChildren<MeshFilter>();
+        // Instantiate temporarily to get accurate world-space measurements
+        GameObject tempInstance = Instantiate(modelObject);
+        tempInstance.transform.position = Vector3.zero;
+        tempInstance.transform.rotation = Quaternion.identity;
+        // Keep the prefab's own scale — this is what gives us real-world size
+
+        MeshFilter meshFilter = tempInstance.GetComponentInChildren<MeshFilter>();
         if (meshFilter == null || meshFilter.sharedMesh == null)
         {
             Debug.LogError("Model has no mesh!");
+            DestroyImmediate(tempInstance);
             return;
+        }
+
+        // Get world-space bounds from renderer (accounts for transform scale)
+        Renderer rend = tempInstance.GetComponentInChildren<Renderer>();
+        Vector3 worldSize = Vector3.zero;
+        if (rend != null)
+        {
+            // Combine all renderer bounds for multi-part models
+            Bounds combinedBounds = rend.bounds;
+            foreach (Renderer r in tempInstance.GetComponentsInChildren<Renderer>())
+            {
+                combinedBounds.Encapsulate(r.bounds);
+            }
+            worldSize = combinedBounds.size;
+        }
+
+        // Extract features from the mesh
+        MeshFeatures features = featureExtractor.ExtractFeatures(meshFilter.sharedMesh);
+
+        // Override bounding box with accurate world-space size
+        if (worldSize.magnitude > 0.01f)
+        {
+            Debug.Log($"[AddModel] Overriding mesh-local bbox {features.boundingBoxSize} " +
+                      $"with world-space bbox {worldSize}");
+            features.boundingBoxSize = worldSize;
+
+            // Recalculate aspect ratios with correct world-space size
+            features.aspectRatioXY = worldSize.x / Mathf.Max(worldSize.y, 0.001f);
+            features.aspectRatioXZ = worldSize.x / Mathf.Max(worldSize.z, 0.001f);
+            features.aspectRatioYZ = worldSize.y / Mathf.Max(worldSize.z, 0.001f);
+
+            // Recalculate suggested category with corrected features
+            // (the category heuristic depends on bounding box size)
         }
 
         ModelEntry entry = new ModelEntry
         {
             name = name,
             category = category,
-            features = featureExtractor.ExtractFeatures(meshFilter.sharedMesh),
+            features = features,
             modelPath = "Models/" + modelObject.name
         };
 
@@ -199,7 +239,9 @@ public class ModelDatabase : MonoBehaviour
         database.Add(entry);
 
         Debug.Log($"Added model '{name}' to database (ID: {entry.id}) with path: {entry.modelPath}");
-        Debug.Log($"  Features: {entry.features}");
+        Debug.Log($"  World-space size: {worldSize}, Features: {entry.features}");
+
+        DestroyImmediate(tempInstance);
 
         SaveDatabase();
     }
@@ -386,6 +428,31 @@ public class ModelDatabase : MonoBehaviour
             Debug.LogError($"Failed to load database: {e.Message}");
             database = new List<ModelEntry>();
         }
+    }
+
+    /// <summary>
+    /// Get the number of models in the database
+    /// </summary>
+    public int GetModelCount()
+    {
+        return database.Count;
+    }
+
+    /// <summary>
+    /// Clear all entries from the database and delete the saved file
+    /// </summary>
+    public void ClearDatabase()
+    {
+        database.Clear();
+
+        string dbFile = Path.Combine(Application.persistentDataPath, databasePath, "database.json");
+        if (File.Exists(dbFile))
+        {
+            File.Delete(dbFile);
+            Debug.Log($"Deleted database file: {dbFile}");
+        }
+
+        Debug.Log("Database cleared");
     }
 
     /// <summary>
